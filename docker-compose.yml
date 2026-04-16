@@ -1,0 +1,104 @@
+version: '3.8'
+
+# Shared config for all Airflow services
+x-airflow-common: &airflow-common
+  build: .
+  environment:
+    # Airflow internals
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    # Pass our app secrets into every Airflow container
+    BLIZZARD_CLIENT_ID: ${BLIZZARD_CLIENT_ID}
+    BLIZZARD_CLIENT_SECRET: ${BLIZZARD_CLIENT_SECRET}
+    BLIZZARD_REALM_ID: ${BLIZZARD_REALM_ID}
+    DATABASE_URL: postgresql://wow_user:wow_pass@postgres/wow_auctions
+  volumes:
+    - ./dags:/opt/airflow/dags          # DAGs are hot-reloaded — no rebuild needed
+    - ./src:/opt/airflow/src            # Our source code
+    - ./data:/opt/airflow/data          # Raw snapshots
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Airflow init (runs once, then exits) ────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        airflow db init &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@localhost
+      "
+    restart: on-failure
+
+  # ── Airflow webserver (UI at localhost:8080) ────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow scheduler (executes the DAGs) ──────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: airflow scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── MLflow tracking server ─────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri postgresql://mlflow:mlflow@postgres/mlflow
+        --default-artifact-root /mlflow/artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+
+volumes:
+  postgres-data:
+  airflow-logs:
+  mlflow-artifacts:
